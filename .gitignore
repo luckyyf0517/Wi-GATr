@@ -22,3 +22,9 @@
 
 # Hydra run output folder
 /outputs
+
+# IDE
+.vscode
+.idea
+.cursor
+.claude
