@@ -6,6 +6,7 @@ Entrypoint to train a regression model. The model and dataset are
 specified via the configuration file.
 """
 
+import logging
 import os
 
 import hydra
@@ -41,6 +42,14 @@ def main(cfg):
     """Entry point for the training. Functionality lives in Experiment classes."""
     # Setup distributed training if running under torchrun
     rank, world_size, local_rank = setup_ddp()
+
+    # Suppress logging on non-rank-0 processes to avoid duplicate output
+    if world_size > 1 and rank != 0:
+        # Set all loggers to WARNING level for non-rank-0 processes
+        logging.getLogger().setLevel(logging.WARNING)
+        # Also suppress common library loggers
+        for name in ["wiinsim", "wigatr", "torch", "hydra"]:
+            logging.getLogger(name).setLevel(logging.WARNING)
 
     # Keeping the target config separate to use global config as argument
     target_cfg = {"_target_": cfg.experiment_target}
