@@ -61,6 +61,35 @@ uv run python scripts/infer_tx.py --config-name infer_tx_wi3r.yaml \
 ```
 Available configs: `infer_tx_wi3r`, `infer_tx_wiptr`.
 
+### Train delay spread prediction models
+
+In addition to RSRP (received power) prediction, you can train models to predict RMS delay spread:
+
+```bash
+# Wi3R delay spread prediction
+uv run python scripts/train.py \
+  --config-name wigatr_wi3r \
+  data=wi3r_delay_spread \
+  data_root_dir=<PATH-TO-DATA>
+
+# WiPTR delay spread prediction
+uv run python scripts/train.py \
+  --config-name wigatr_wiptr \
+  data=wiptr_delay_spread \
+  data_root_dir=<PATH-TO-DATA>
+```
+
+The delay spread is computed from MPC data using the standard RMS formula: τ_rms = sqrt(Σ P_i · (τ_i - τ_mean)² / Σ P_i)
+
+For accurate normalization parameters, compute statistics from your dataset:
+
+```bash
+uv run python scripts/compute_target_stats.py \
+  --config-name wigatr_wi3r \
+  data=wi3r_delay_spread \
+  num_samples=10000
+```
+
 ### Test the setup: Overfit on the training set
 
 You can overfit Wi-GATr on a small subset of the data to quickly test that all scripts are running as expected but without training the model properly.

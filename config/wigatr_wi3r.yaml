@@ -2,7 +2,7 @@
 defaults:
   - data: wi3r
   - _self_
-data_root_dir: ???
+data_root_dir: data
 data:
   reciprocity_augmentation: 0
 exp_dir: 'experiments/${exp_name}/${run_name}'

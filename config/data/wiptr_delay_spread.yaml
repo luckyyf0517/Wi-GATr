@@ -1,0 +1,27 @@
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+# WiPTR dataset configuration for delay spread prediction
+#
+# This config inherits from the base wiptr config and overrides the target function
+# to compute RMS delay spread from MPC data instead of received power.
+#
+# The target_scaling parameters below are approximate values. For accurate results,
+# run scripts/compute_target_stats.py with target_data_fct=compute_delay_spread_from_mpc
+#
+# Usage:
+#   uv run python scripts/train.py --config-name=wigatr_wiptr data=wiptr_delay_spread
+
+defaults:
+  - wiptr@_here_
+  - _self_
+
+# Override target function to compute delay spread from MPC
+target_data_fct: compute_delay_spread_from_mpc
+
+# Normalization parameters for delay spread (in nanoseconds)
+# These are approximate values - recompute with compute_target_stats.py for your data
+target_scaling:
+  mean: 15.0
+  std: 10.0
+  min: 0.0
+  max: 100.0

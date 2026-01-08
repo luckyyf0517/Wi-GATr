@@ -202,10 +202,40 @@ uv run python scripts/train.py \
 
 ### Step 4.3: Available configs
 
-- `wigatr_wi3r` - Full Wi3R training with Wi-GATr
-- `wigatr_wiptr` - Full WiPTR training with Wi-GATr
+- `wigatr_wi3r` - Full Wi3R training with Wi-GATr (RSRP prediction)
+- `wigatr_wiptr` - Full WiPTR training with Wi-GATr (RSRP prediction)
 - `transformer_wi3r` - Full Wi3R training with standard Transformer
 - `transformer_wiptr` - Full WiPTR training with standard Transformer
+
+### Step 4.4: Delay Spread Prediction
+
+You can also train models to predict RMS delay spread instead of RSRP:
+
+```bash
+# Wi3R delay spread training
+uv run python scripts/train.py \
+  --config-name=wigatr_wi3r \
+  data=wi3r_delay_spread \
+  data_root_dir=~/datasets
+
+# WiPTR delay spread training
+uv run python scripts/train.py \
+  --config-name=wigatr_wiptr \
+  data=wiptr_delay_spread \
+  data_root_dir=~/datasets
+```
+
+**Note**: The `target_scaling` parameters in delay spread configs are approximate. For optimal results, run the statistics computation script first:
+
+```bash
+# Compute accurate normalization parameters for delay spread
+uv run python scripts/compute_target_stats.py \
+  --config-name=wigatr_wi3r \
+  data=wi3r_delay_spread \
+  num_samples=10000
+```
+
+Then update the `target_scaling` values in the config file with the computed statistics.
 
 ## 5. Troubleshooting
 

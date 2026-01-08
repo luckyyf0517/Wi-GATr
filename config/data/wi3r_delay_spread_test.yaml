@@ -1,0 +1,33 @@
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+# Wi3R test configuration for delay spread prediction (overfit on small subset)
+#
+# This config uses minimal data for quick validation that delay spread training works.
+# All splits use the same small data subset to verify the model can overfit.
+#
+# Expected results (after 1001 steps):
+# - MAE and RMSE < 5 ns for all splits (overfitting on same data)
+# - Training completes in ~10 minutes
+# - Uses < 12GB GPU memory
+#
+# Usage:
+#   uv run python scripts/train.py \
+#     --config-name=wigatr_wi3r \
+#     data=wi3r_delay_spread_test \
+#     exp_name=wi3r_delay_spread_test \
+#     training.steps=1001
+
+defaults:
+  - wi3r_test_overfit@_here_
+  - _self_
+
+# Override target function to compute delay spread from MPC
+target_data_fct: compute_delay_spread_from_mpc
+
+# Normalization parameters for delay spread (in nanoseconds)
+# Computed from 1000 samples: mean=1.34, std=0.43, range=[0.16, 2.60]
+target_scaling:
+  mean: 1.3449
+  std: 0.4286
+  min: 0.1611
+  max: 2.5986

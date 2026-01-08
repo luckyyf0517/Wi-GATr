@@ -41,8 +41,14 @@ def extract_power_db(data):
 
 @target_data_function
 def extract_delay_spread(data):
-    """Extracts existing power in dB from data item"""
+    """Extracts existing delay spread from data item"""
     return data["delay_spread"]
+
+
+@target_data_function
+def compute_delay_spread_from_mpc(data):
+    """Computes RMS delay spread from MPC data in data item"""
+    return get_delay_spread_from_mpc(data["mpc"])
 
 
 def get_total_power_received_from_mpc(mpc):
@@ -53,6 +59,60 @@ def get_total_power_received_from_mpc(mpc):
     total_power = torch.logsumexp(2.0 * path_strength_db * factor, dim=0, keepdim=True) / factor
     # The 2.0 is because the mpc describes amplitudes, but we care about power
     return total_power
+
+
+def get_delay_spread_from_mpc(mpc):
+    """Compute RMS delay spread from MPC data.
+
+    RMS (Root Mean Square) delay spread is a key channel characteristic that measures
+    the dispersion of multipath components in time. It affects inter-symbol interference
+    and equalizer complexity in wireless systems.
+
+    Formula: τ_rms = sqrt(Σ P_i · (τ_i - τ_mean)² / Σ P_i)
+    where:
+        P_i = linear power of path i (converted from dB)
+        τ_i = delay of path i in nanoseconds
+        τ_mean = power-weighted mean delay
+
+    MPC data structure (from WiInSim HDF5 files):
+        mpc[0] = path_strength_db (dB) - path strength in dB
+        mpc[1] = delay (nanoseconds) - propagation delay
+        mpc[2] = aoa_azimuth - angle of arrival azimuth
+        mpc[3] = aoa_elevation - angle of arrival elevation
+        mpc[4] = aod_azimuth - angle of departure azimuth
+        mpc[5] = aod_elevation - angle of departure elevation
+        mpc[6] = valid_flag - path validity mask (0=invalid, >0=valid)
+
+    Args:
+        mpc: Tensor of shape (7, num_paths) containing MPC data from WiInSim dataset
+
+    Returns:
+        Tensor: Scalar RMS delay spread in nanoseconds
+    """
+    mask = mpc[-1].to(torch.bool)  # valid paths
+
+    # Check if there are any valid paths
+    if not mask.any():
+        return torch.tensor(0.0, dtype=mpc.dtype, device=mpc.device)
+
+    # Extract path strengths and delays
+    path_strength_db = mpc[0, mask]  # Path strength in dB
+    delays_ns = mpc[1, mask]  # Delays in nanoseconds
+
+    # Convert dB to linear power: P_linear = 10^(P_dB/10)
+    # Using log/exp for numerical stability: P_linear = exp(P_dB * ln(10)/10)
+    factor = np.log(10.0) / 10.0
+    powers_linear = torch.exp(2.0 * path_strength_db * factor)
+
+    # Compute power-weighted mean delay: τ_mean = Σ(P_i * τ_i) / Σ(P_i)
+    total_power = torch.sum(powers_linear)
+    mean_delay = torch.sum(powers_linear * delays_ns) / total_power
+
+    # Compute RMS delay spread: τ_rms = sqrt(Σ P_i * (τ_i - τ_mean)² / Σ P_i)
+    delay_variance = torch.sum(powers_linear * (delays_ns - mean_delay) ** 2) / total_power
+    delay_spread = torch.sqrt(delay_variance)
+
+    return delay_spread
 
 
 def translation_transform(tx, rx, mesh, invariant_target):
@@ -173,11 +233,16 @@ def load_wiinsim_dataset(data_cfg, partition, max_floor_plans):
     wiinsim_config = deepcopy(data_cfg.wiinsim)
     with open_dict(wiinsim_config):
         target_data_fct_name = data_cfg.get(
-            "target_data_fct_name", "compute_non_coherent_total_power"
+            "target_data_fct", "compute_non_coherent_total_power"
         )
-        assert target_data_fct_name == "compute_non_coherent_total_power"
-        # Note: This assumes that target_scaling refers to powers in db.
-        # If you want to use different targets, first make sure that wiinsim can support that.
+        # Validate target function against available options
+        if target_data_fct_name not in TARGET_DATA_FCTS:
+            raise ValueError(
+                f"Unknown target_data_fct: '{target_data_fct_name}'. "
+                f"Available options: {list(TARGET_DATA_FCTS.keys())}"
+            )
+        # Note: target_scaling refers to normalization parameters for the target variable.
+        # For non-power targets (e.g., delay spread), these should be computed from the dataset.
         wiinsim_config["gains_db_attrs"] = data_cfg.target_scaling
     overwrite_dir, floor_ids, wiinsim_config.tx_idx, wiinsim_config.rx_idx = load_partition_wiinsim(
         data_cfg.splits, partition, max_floor_plans
