@@ -43,9 +43,15 @@ class BaseExperiment:
     Explicitly included here to make it easier for us to adapt it.
     """
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, rank=0, world_size=1, local_rank=0):
         # Store config
         self.cfg = cfg
+
+        # Distributed training parameters
+        self.rank = rank
+        self.world_size = world_size
+        self.local_rank = local_rank
+        self.is_rank_0 = (rank == 0)
 
         # Device, dtype, backend
         self.device, self.dtype = self._init_backend()
@@ -116,16 +122,33 @@ class BaseExperiment:
 
         # Create model
         self.model = self._create_model()
+
+        # Move model to device before wrapping in DDP
+        self.model = self.model.to(self.device)
+
+        # Wrap in DDP if distributed
+        if self.world_size > 1:
+            self.model = torch.nn.parallel.DistributedDataParallel(
+                self.model,
+                device_ids=[self.local_rank],
+                output_device=self.local_rank,
+                find_unused_parameters=True,
+            )
+
         self.optim, self.scheduler = self.create_optimizer_and_scheduler()
 
         # Report number of parameters
         num_parameters = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        logger.info("Model has %.1f M learnable parameters", num_parameters / 1e6)
+        if self.is_rank_0:
+            logger.info("Model has %.1f M learnable parameters", num_parameters / 1e6)
         # Create exponential moving average object
         if self.cfg.training.ema:
-            logger.info("Using EMA for validation and eval")
+            if self.is_rank_0:
+                logger.info("Using EMA for validation and eval")
+            # EMA needs to access the underlying model if wrapped in DDP
+            model_params = self.model.module.parameters() if self.world_size > 1 else self.model.parameters()
             self.ema = ExponentialMovingAverage(
-                self.model.parameters(), decay=self.cfg.training.ema_decay
+                model_params, decay=self.cfg.training.ema_decay
             )
         else:
             logger.debug("Not using EMA")
@@ -144,20 +167,25 @@ class BaseExperiment:
             checkpoint = self.cfg.checkpoint
 
         if checkpoint is not None:
-            logger.info("Loading model checkpoint from %s", checkpoint)
+            if self.is_rank_0:
+                logger.info("Loading model checkpoint from %s", checkpoint)
             state_dict = torch.load(checkpoint, map_location="cpu")
-            self.model.load_state_dict(state_dict)
+            # Load state dict into the model (or model.module if wrapped in DDP)
+            model_to_load = self.model.module if self.world_size > 1 else self.model
+            model_to_load.load_state_dict(state_dict)
 
             if self.cfg.training.ema:
                 ema_checkpoint = checkpoint.replace(".pt", "_ema.pt")
-                logger.info("Loading EMA checkpoint from %s", ema_checkpoint)
+                if self.is_rank_0:
+                    logger.info("Loading EMA checkpoint from %s", ema_checkpoint)
                 state_dict = torch.load(ema_checkpoint, map_location="cpu")
                 self.ema.load_state_dict(state_dict)
 
     def train(self):
         """High-level training function."""
 
-        logger.info("Starting training")
+        if self.is_rank_0:
+            logger.info("Starting training")
 
         # Prepare data
         train_data = self._load_dataset("train")
@@ -172,21 +200,22 @@ class BaseExperiment:
         num_epochs = (self.cfg.training.steps - 1) // (
             (len(train_data) - 1) // self.cfg.training.batchsize + 1
         ) + 1
-        logger.info(
-            "Training for %d steps, that is, %d epochs on a "
-            "dataset of size %d with batchsize %d",
-            self.cfg.training.steps,
-            num_epochs,
-            len(train_data),
-            self.cfg.training.batchsize,
-        )
+        if self.is_rank_0:
+            logger.info(
+                "Training for %d steps, that is, %d epochs on a "
+                "dataset of size %d with batchsize %d",
+                self.cfg.training.steps,
+                num_epochs,
+                len(train_data),
+                self.cfg.training.batchsize,
+            )
 
         # Prepare book-keeping
         self._best_state = {"state_dict": None, "loss": None, "step": None}
         self._training_start_time = time.time()
 
         # GPU
-        self.model = self.model.to(self.device)
+        # Model is already on the correct device from create_model()
         if self.ema:
             self.ema.to(self.device)
 
@@ -196,11 +225,15 @@ class BaseExperiment:
             epoch_start = time.perf_counter()
             self.model.train()
 
+            # Set epoch for distributed sampler to ensure different shuffling each epoch
+            if self.world_size > 1 and hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
+                train_loader.sampler.set_epoch(epoch)
+
             # Loop over steps
             for data in tqdm(
                 train_loader,
                 total=len(train_loader),
-                disable=not self.cfg.training.progressbar,
+                disable=not self.cfg.training.progressbar or not self.is_rank_0,
                 desc=f"Epoch {epoch}",
             ):
                 self._step(data, step, val_data, val_loader)
@@ -252,16 +285,19 @@ class BaseExperiment:
 
         # Log
         self.metrics["val"] = metrics
-        logger.info("Validation loop at step %d:", step)
-        for key, value in metrics.items():
-            logger.info("    %s = %s", key, value)
+        if self.is_rank_0:
+            logger.info("Validation loop at step %d:", step)
+            for key, value in metrics.items():
+                logger.info("    %s = %s", key, value)
 
         # Early stopping: compare val loss to last val loss
+        # Only rank 0 needs to track best state for checkpointing
         new_val_loss = metrics["loss"]
-        if self._best_state["loss"] is None or new_val_loss < self._best_state["loss"]:
-            self._best_state["loss"] = new_val_loss
-            self._best_state["state_dict"] = self.model.state_dict().copy()
-            self._best_state["step"] = step
+        if self.is_rank_0:
+            if self._best_state["loss"] is None or new_val_loss < self._best_state["loss"]:
+                self._best_state["loss"] = new_val_loss
+                self._best_state["state_dict"] = self.model.state_dict().copy()
+                self._best_state["step"] = step
 
     def evaluate(self):
         """Evaluates self.model on all eval datasets and logs the results"""
@@ -290,29 +326,37 @@ class BaseExperiment:
                 else:
                     metrics = self._compute_metrics(dataloader)
 
-                # Log results
+                # Log results (only on rank 0)
                 self.metrics[full_tag] = metrics
-                logger.info("Ran evaluation on dataset %s:", full_tag)
-                for key, val in metrics.items():
-                    logger.info("    %s = %s", key, val)
+                if self.is_rank_0:
+                    logger.info("Ran evaluation on dataset %s:", full_tag)
+                    for key, val in metrics.items():
+                        logger.info("    %s = %s", key, val)
 
-                # Store results in csv file
-                # Pandas does not like scalar values, have to be iterables
-                test_metrics_ = {key: [val] for key, val in metrics.items()}
-                df = pd.DataFrame.from_dict(test_metrics_)
-                df.to_csv(Path(self.cfg.exp_dir) / "metrics" / f"eval_{full_tag}.csv")
-                dfs[full_tag] = df
+                # Store results in csv file (only on rank 0)
+                if self.is_rank_0:
+                    # Pandas does not like scalar values, have to be iterables
+                    test_metrics_ = {key: [val] for key, val in metrics.items()}
+                    df = pd.DataFrame.from_dict(test_metrics_)
+                    df.to_csv(Path(self.cfg.exp_dir) / "metrics" / f"eval_{full_tag}.csv")
+                    dfs[full_tag] = df
         return dfs
 
     def save_model(self, filename=None):
         """Save model in experiment folder"""
+
+        # Only save on rank 0 in distributed mode
+        if not self.is_rank_0:
+            return
 
         if filename is None:
             filename = "model.pt"
 
         model_path = Path(self.cfg.exp_dir) / "models" / filename
         logger.info("Saving model at %s", model_path)
-        torch.save(self.model.state_dict(), model_path)
+        # Save the underlying model if wrapped in DDP
+        state_dict = self.model.module.state_dict() if self.world_size > 1 else self.model.state_dict()
+        torch.save(state_dict, model_path)
 
         if self.ema is not None:
             ema_path = Path(self.cfg.exp_dir) / "models" / filename.replace(".pt", "_ema.pt")
@@ -328,19 +372,26 @@ class BaseExperiment:
         """Initializes device, dtype, and attention implementation"""
 
         # Device
-        device = get_device()
+        if self.world_size > 1:
+            # In distributed mode, device is already set by torchrun
+            device = torch.device(f"cuda:{self.local_rank}")
+        else:
+            device = get_device()
         logger.debug("Training on %s", device)
 
         # Dtype
         if self.cfg.training.float16 and torch.cuda.is_bf16_supported():
             dtype = torch.bfloat16
-            logger.info("Training on bfloat16")
+            if self.is_rank_0:
+                logger.info("Training on bfloat16")
         elif self.cfg.training.float16:
             dtype = torch.float16
-            logger.info("Training on float16 (bfloat16 is not supported by environment)")
+            if self.is_rank_0:
+                logger.info("Training on float16 (bfloat16 is not supported by environment)")
         else:
             dtype = torch.float32
-            logger.info("Training on float32")
+            if self.is_rank_0:
+                logger.info("Training on float32")
 
         # Attention implementation
         logger.debug("Forcing use of xformers' attention implementation")
@@ -361,28 +412,32 @@ class BaseExperiment:
 
         optimizer_choice = self.cfg.training.get("optimizer", "adam")
         if optimizer_choice == "adam":
-            logger.info("Initializing Adam optimizer.")
+            if self.is_rank_0:
+                logger.info("Initializing Adam optimizer.")
             optim = torch.optim.Adam(
                 self.model.parameters(),
                 lr=self.cfg.training.lr,
                 weight_decay=self.cfg.training.weight_decay,
             )
         elif optimizer_choice == "rmsprop":
-            logger.info("Initializing RMSProp optimizer.")
+            if self.is_rank_0:
+                logger.info("Initializing RMSProp optimizer.")
             optim = torch.optim.RMSprop(
                 self.model.parameters(),
                 lr=self.cfg.training.lr,
                 weight_decay=self.cfg.training.weight_decay,
             )
         elif optimizer_choice == "sgd":
-            logger.info("Initializing SGD optimizer.")
+            if self.is_rank_0:
+                logger.info("Initializing SGD optimizer.")
             optim = torch.optim.SGD(
                 self.model.parameters(),
                 lr=self.cfg.training.lr,
                 weight_decay=self.cfg.training.weight_decay,
             )
         elif optimizer_choice == "sgd+momentum":
-            logger.info("Initializing SGD+Momentum optimizer.")
+            if self.is_rank_0:
+                logger.info("Initializing SGD+Momentum optimizer.")
             optim = torch.optim.SGD(
                 self.model.parameters(),
                 lr=self.cfg.training.lr,
@@ -428,28 +483,30 @@ class BaseExperiment:
         self._log(loss, metrics, grad_norm, step)
 
         # Debugging output
-        if step == 0:
+        if step == 0 and self.is_rank_0:
             logger.info("Finished first forward pass with loss %f", loss.item())
 
         # Validation loop
         if frequency_check(step, self.cfg.training.validate_every_n_steps, skip_initial=False):
-            logger.info("Starting validation at step %d", step)
+            if self.is_rank_0:
+                logger.info("Starting validation at step %d", step)
             self.validate(val_loader, step)
 
-        # Plotting
+        # Plotting (only on rank 0)
         if frequency_check(
             step, self.cfg.training.plot_every_n_steps, include_fractional=(0.01, 0.1)
         ):
             self.visualize(val_data, step)
 
-        # Save model checkpoint
+        # Save model checkpoint (only rank 0 saves in save_model)
         if frequency_check(step, self.cfg.training.save_model_every_n_steps, skip_initial=True):
             self.save_model(f"model_step_{step}.pt")
 
         # LR scheduler
         if frequency_check(step, self.cfg.training.update_lr_every_n_steps, skip_initial=True):
             self.scheduler.step()
-            logger.debug("Decaying LR to %f", self.scheduler.get_last_lr()[0])
+            if self.is_rank_0:
+                logger.debug("Decaying LR to %f", self.scheduler.get_last_lr()[0])
 
         # Custom hooks
         for hook_step, hook in self._hooks:
@@ -460,7 +517,8 @@ class BaseExperiment:
         """Set random seed and initialize plotting"""
 
         # Print config to log
-        logger.info("Running experiment at %s", self.cfg.exp_dir)
+        if self.is_rank_0:
+            logger.info("Running experiment at %s", self.cfg.exp_dir)
         logger.debug("Config: \n%s", str(OmegaConf.to_yaml(self.cfg)))
 
         # Set random seed
@@ -483,11 +541,18 @@ class BaseExperiment:
         # Create experiment subfolders (main folder will be automatically created as well)
         for subdir in subfolders:
             if subdir.exists():
-                logger.warning("Warning: directory %s already exists!", subdir.as_posix())
+                if self.is_rank_0:
+                    logger.warning("Warning: directory %s already exists!", subdir.as_posix())
             subdir.mkdir(parents=True, exist_ok=True)
 
     def _initialize_logger(self):
         """Initializes logging"""
+
+        # In distributed mode, only set up handlers on rank 0
+        if self.world_size > 1 and not self.is_rank_0:
+            # Set level to WARNING to suppress most logs on non-rank-0 processes
+            logger.setLevel(logging.WARNING)
+            return
 
         # In sweeps (multiple experiments in one job) we don't want to set up the handlers again
         if wigatr.utils.logger.LOGGING_INITIALIZED:
@@ -495,8 +560,10 @@ class BaseExperiment:
             return
 
         logger.setLevel(logging.DEBUG if self.cfg.debug else logging.INFO)
+        # Add rank to log format
+        rank_str = f"[Rank {self.rank}]" if self.world_size > 1 else ""
         formatter = logging.Formatter(
-            "[%(asctime)-19.19s %(levelname)-1.1s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+            f"[%(asctime)-19.19s %(levelname)-1.1s]{rank_str} %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
         )
 
         file_handler = logging.FileHandler(Path(self.cfg.exp_dir) / "output.log")
@@ -524,6 +591,10 @@ class BaseExperiment:
 
     def _save_config(self):
         """Stores the config in the experiment folder"""
+
+        # Only save config on rank 0
+        if not self.is_rank_0:
+            return
 
         # Save config
         config_filename = Path(self.cfg.exp_dir) / "config.yaml"
@@ -617,13 +688,17 @@ class BaseExperiment:
 
         # Move to eval mode and eval device
         self.model.eval()
-        eval_device = torch.device(self.cfg.training.eval_device)
-        self.model = self.model.to(eval_device)
+        # In distributed mode, keep model on its current device
+        if self.world_size == 1:
+            eval_device = torch.device(self.cfg.training.eval_device)
+            self.model = self.model.to(eval_device)
+        else:
+            eval_device = self.device
 
         aggregate_metrics = defaultdict(float)
 
         # Loop over dataset and compute error
-        for data in tqdm(dataloader, disable=not self.cfg.training.progressbar, desc="Evaluating"):
+        for data in tqdm(dataloader, disable=not self.cfg.training.progressbar or not self.is_rank_0, desc="Evaluating"):
             data = self._prep_data(data, device=eval_device)
 
             # Forward pass
@@ -640,7 +715,9 @@ class BaseExperiment:
 
         # Move model back to training mode and training device
         self.model.train()
-        self.model = self.model.to(self.device)
+        # In distributed mode, model is already on the correct device
+        if self.world_size == 1:
+            self.model = self.model.to(self.device)
 
         # Return metrics
         return aggregate_metrics
@@ -663,6 +740,15 @@ class BaseExperiment:
         dataloader
             Data loader.
         """
+        # Use DistributedSampler in distributed mode
+        if self.world_size > 1:
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                dataset,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=shuffle,
+            )
+            return DataLoader(dataset, batch_size=batch_size, sampler=sampler)
         return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
     def _create_model(self):

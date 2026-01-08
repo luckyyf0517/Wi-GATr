@@ -24,8 +24,8 @@ from wigatr.utils.logger import logger
 class RegressionExperiment(BaseExperiment):
     """Base experiment for RSRP regression."""
 
-    def __init__(self, cfg):
-        super().__init__(cfg)
+    def __init__(self, cfg, rank=0, world_size=1, local_rank=0):
+        super().__init__(cfg, rank=rank, world_size=world_size, local_rank=local_rank)
 
         self._mse_criterion = torch.nn.MSELoss(reduction="mean")
         self._mae_criterion = torch.nn.L1Loss(reduction="mean")
@@ -45,7 +45,9 @@ class RegressionExperiment(BaseExperiment):
         if self.model is None:
             return None
 
-        return self.model.data_mode
+        # Access the underlying model if wrapped in DDP
+        model = self.model.module if self.world_size > 1 else self.model
+        return model.data_mode
 
     def _load_dataset(self, tag):
         """
@@ -155,9 +157,21 @@ class RegressionExperiment(BaseExperiment):
         logger.debug("Creating data loader")
 
         if self.mode == "geometry":
-            loader = torch_geometric.loader.DataLoader(
-                dataset, batch_size=batch_size, shuffle=shuffle, num_workers=8, pin_memory=True
-            )
+            # Use DistributedSampler in distributed mode for torch_geometric
+            if self.world_size > 1:
+                sampler = torch.utils.data.distributed.DistributedSampler(
+                    dataset,
+                    num_replicas=self.world_size,
+                    rank=self.rank,
+                    shuffle=shuffle,
+                )
+                loader = torch_geometric.loader.DataLoader(
+                    dataset, batch_size=batch_size, sampler=sampler, num_workers=8, pin_memory=True
+                )
+            else:
+                loader = torch_geometric.loader.DataLoader(
+                    dataset, batch_size=batch_size, shuffle=shuffle, num_workers=8, pin_memory=True
+                )
         else:
             raise ValueError(f"Experiment mode {self.mode} not supported")
 
@@ -343,7 +357,7 @@ class RegressionExperiment(BaseExperiment):
         loss_initial = None
 
         # Let's go
-        for step in (pbar := trange(self.cfg.inverse.steps, desc="Inverse solver.")):
+        for step in (pbar := trange(self.cfg.inverse.steps, desc="Inverse solver.", disable=not self.is_rank_0)):
             # Model forward pass
             y_pred = self.model(data, overrides={"tx": tx})
 
