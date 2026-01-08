@@ -70,3 +70,9 @@ training:
   eval_device: cuda
   progressbar: true
   detect_anomaly: false
+profiling:
+  enabled: false
+  level: 2
+  output_dir: ${exp_dir}/profiling
+  report_every_n_steps: 100
+  gpu_monitoring: true

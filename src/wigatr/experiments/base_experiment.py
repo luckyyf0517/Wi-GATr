@@ -30,6 +30,7 @@ import wigatr.utils.logger
 from wigatr.utils.logger import logger
 from wigatr.utils.misc import frequency_check, get_batchsize
 from wigatr.utils.plotting import MATPLOTLIB_PARAMS
+from wigatr.utils.profiler import GPUMonitor, Profiler
 
 cs = ConfigStore.instance()
 cs.store(name="base_attention", node=SelfAttentionConfig)
@@ -65,6 +66,21 @@ class BaseExperiment:
         self.metrics = {}
         self._best_state = None
         self._training_start_time = None
+
+        # Initialize profiler (only on rank 0)
+        profiling_cfg = self.cfg.get("profiling", None)
+        if profiling_cfg and profiling_cfg.get("enabled", False) and self.is_rank_0:
+            profiler_level = profiling_cfg.get("level", 0)
+            profiler_output = profiling_cfg.get("output_dir", None)
+            self.profiler = Profiler(level=profiler_level, output_dir=profiler_output)
+
+            if profiling_cfg.get("gpu_monitoring", False):
+                self.gpu_monitor = GPUMonitor(output_dir=profiler_output)
+            else:
+                self.gpu_monitor = None
+        else:
+            self.profiler = None
+            self.gpu_monitor = None
 
         # Initialize folder and logger
         self._initialize_experiment_folder()
@@ -459,19 +475,30 @@ class BaseExperiment:
     def _step(self, data, step, val_data, val_loader):
         """Everything that that may happen per step"""
 
-        # Move data to GPU, and other and other data prep stuff
-        data = self._prep_data(data)
+        # Profile data preparation
+        prof_ctx = self.profiler.record("step_data_prep", sync_gpu=True) if self.profiler else nullcontext()
+        with prof_ctx:
+            # Move data to GPU, and other and other data prep stuff
+            data = self._prep_data(data)
 
         # Forward pass
-        with torch.autocast(
-            device_type="cuda", dtype=self.dtype, enabled=self.cfg.training.float16
-        ):
-            ctx = torch.autograd.detect_anomaly if self.cfg.training.detect_anomaly else nullcontext
-            with ctx():
-                loss, metrics = self._forward(*data)
+        prof_ctx = self.profiler.record("step_forward", sync_gpu=True) if self.profiler else nullcontext()
+        with prof_ctx:
+            with torch.autocast(
+                device_type="cuda", dtype=self.dtype, enabled=self.cfg.training.float16
+            ):
+                ctx = torch.autograd.detect_anomaly if self.cfg.training.detect_anomaly else nullcontext
+                with ctx():
+                    loss, metrics = self._forward(*data)
 
         # Optimizer step
-        grad_norm = self._optimizer_step(loss)
+        prof_ctx = self.profiler.record("step_backward", sync_gpu=True) if self.profiler else nullcontext()
+        with prof_ctx:
+            grad_norm = self._optimizer_step(loss)
+
+        prof_ctx = self.profiler.record("step_optimizer", sync_gpu=True) if self.profiler else nullcontext()
+        with prof_ctx:
+            pass  # Optimizer step already done in _optimizer_step
 
         # Post-step hooks: logging, validating, checkpoint saving, etc
         self._post_step(loss, metrics, grad_norm, step, val_data, val_loader)
@@ -487,7 +514,7 @@ class BaseExperiment:
             logger.info("Finished first forward pass with loss %f", loss.item())
 
         # Validation loop
-        if frequency_check(step, self.cfg.training.validate_every_n_steps, skip_initial=False):
+        if frequency_check(step, self.cfg.training.validate_every_n_steps, skip_initial=True):
             if self.is_rank_0:
                 logger.info("Starting validation at step %d", step)
             self.validate(val_loader, step)
@@ -512,6 +539,20 @@ class BaseExperiment:
         for hook_step, hook in self._hooks:
             if hook_step == step:
                 hook(model=self.model, step=step, experiment=self)
+
+        # Profiling report generation
+        if self.profiler and hasattr(self.cfg, "profiling"):
+            report_freq = self.cfg.profiling.get("report_every_n_steps", None)
+            if report_freq and frequency_check(step, report_freq, skip_initial=True):
+                if self.is_rank_0:
+                    report = self.profiler.summarize(step)
+                    logger.info("Performance Report:\n%s", report)
+                    self.profiler.save_report(step)
+                    self.profiler.reset()
+
+                if self.gpu_monitor:
+                    self.gpu_monitor.save_data(step)
+                    self.gpu_monitor.reset()
 
     def _initialize_experiment(self):
         """Set random seed and initialize plotting"""

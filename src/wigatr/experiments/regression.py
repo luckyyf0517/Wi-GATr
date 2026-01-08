@@ -67,7 +67,7 @@ class RegressionExperiment(BaseExperiment):
         logger.debug("Loading %s dataset", tag)
 
         if self.mode == "geometry":
-            dataset = GeometricDataset(self.cfg.data, tag)
+            dataset = GeometricDataset(self.cfg.data, tag, profiler=self.profiler)
         else:
             raise ValueError(f"Experiment mode {self.mode} not supported")
 

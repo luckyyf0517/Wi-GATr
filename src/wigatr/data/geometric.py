@@ -26,11 +26,12 @@ class GeometricDataset(torch.utils.data.Dataset):
     - packages everything as a torch_geometric graph object
     """
 
-    def __init__(self, data_cfg, partition):
+    def __init__(self, data_cfg, partition, profiler=None):
         super().__init__()
 
         # Dataset partitioning
         self.partition = partition
+        self.profiler = profiler  # Optional profiler for performance analysis
 
         # Transfromations, augmentation, canonicalization
         self.reciprocity_augmentation = (
@@ -100,23 +101,39 @@ class GeometricDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         """Returns the `idx`-th sample from the dataset"""
 
-        # Get raw channel info
-        data = self._dataset[idx]
+        # Profile raw data load
+        if self.profiler and self.profiler.level >= 2:
+            with self.profiler.record("data_raw_load"):
+                data = self._dataset[idx]
+        else:
+            data = self._dataset[idx]
         # This is a dict with keys rx_xyz, tx_xyz, mpc, tx_idx, rx_idx, floor_id, floor_idx
 
-        # Compute total power received
+        # Profile target computation
+        if self.profiler and self.profiler.level >= 2:
+            with self.profiler.record("data_target_compute"):
+                invariant_target = self.extract_target(data)
+        else:
+            invariant_target = self.extract_target(data)
         # This target is assume to be invariant under E(3).
-        invariant_target = self.extract_target(data)
 
-        # Get mesh from cache
-        mesh, materials = self._get_mesh(data["floor_idx"])
+        # Profile mesh loading
+        if self.profiler and self.profiler.level >= 2:
+            with self.profiler.record("data_mesh_load"):
+                mesh, materials = self._get_mesh(data["floor_idx"])
+        else:
+            mesh, materials = self._get_mesh(data["floor_idx"])
 
         # Get Tx and Rx positions
         tx = data["tx_xyz"]
         rx = data["rx_xyz"]
 
-        # Transforms
-        tx, rx, mesh, invariant_target, _ = self.transform(tx, rx, mesh, invariant_target)
+        # Profile transforms
+        if self.profiler and self.profiler.level >= 2:
+            with self.profiler.record("data_transforms"):
+                tx, rx, mesh, invariant_target, _ = self.transform(tx, rx, mesh, invariant_target)
+        else:
+            tx, rx, mesh, invariant_target, _ = self.transform(tx, rx, mesh, invariant_target)
 
         # Reciprocity augmentation
         if self.reciprocity_augmentation:
@@ -124,14 +141,24 @@ class GeometricDataset(torch.utils.data.Dataset):
             if flip:
                 tx, rx = rx, tx
 
-        # E(2) augmentation
+        # Profile E(2) augmentation
         if self.e2_augmentation:
-            tx, rx, mesh, invariant_target, _ = random_e2_transform(tx, rx, mesh, invariant_target)
+            if self.profiler and self.profiler.level >= 2:
+                with self.profiler.record("data_e2_augment"):
+                    tx, rx, mesh, invariant_target, _ = random_e2_transform(tx, rx, mesh, invariant_target)
+            else:
+                tx, rx, mesh, invariant_target, _ = random_e2_transform(tx, rx, mesh, invariant_target)
 
-        # Canonicalize
-        tx, rx, mesh, invariant_target, canonicalization_shift = self.canonicalize(
-            tx, rx, mesh, invariant_target
-        )
+        # Profile canonicalization
+        if self.profiler and self.profiler.level >= 2:
+            with self.profiler.record("data_canonicalize"):
+                tx, rx, mesh, invariant_target, canonicalization_shift = self.canonicalize(
+                    tx, rx, mesh, invariant_target
+                )
+        else:
+            tx, rx, mesh, invariant_target, canonicalization_shift = self.canonicalize(
+                tx, rx, mesh, invariant_target
+            )
 
         # Check inputs
         check_sane(tx, f"loading sample {idx}: Tx")
@@ -141,17 +168,30 @@ class GeometricDataset(torch.utils.data.Dataset):
         if materials is not None:
             check_sane(materials, f"loading sample {idx}: materials")
 
-        # Tokenize
-        data = tokenize_scene(
-            tx,
-            rx,
-            mesh,
-            invariant_target,
-            materials,
-            add_edge_index=self.add_edge_index,
-            num_materials=self.num_materials,
-            canonicalization_shift=canonicalization_shift,
-        )
+        # Profile tokenization
+        if self.profiler and self.profiler.level >= 2:
+            with self.profiler.record("data_tokenize"):
+                data = tokenize_scene(
+                    tx,
+                    rx,
+                    mesh,
+                    invariant_target,
+                    materials,
+                    add_edge_index=self.add_edge_index,
+                    num_materials=self.num_materials,
+                    canonicalization_shift=canonicalization_shift,
+                )
+        else:
+            data = tokenize_scene(
+                tx,
+                rx,
+                mesh,
+                invariant_target,
+                materials,
+                add_edge_index=self.add_edge_index,
+                num_materials=self.num_materials,
+                canonicalization_shift=canonicalization_shift,
+            )
 
         return data
 
