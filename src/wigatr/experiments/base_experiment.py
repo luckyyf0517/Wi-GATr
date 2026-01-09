@@ -213,9 +213,10 @@ class BaseExperiment:
         val_loader = self._make_data_loader(val_data, batch_size=eval_batchsize, shuffle=False)
 
         # Training
-        num_epochs = (self.cfg.training.steps - 1) // (
-            (len(train_data) - 1) // self.cfg.training.batchsize + 1
-        ) + 1
+        # Use len(train_loader) to correctly compute steps per epoch in distributed training
+        # With DistributedSampler, len(train_loader) = ceil(len(dataset) / (world_size * batchsize))
+        steps_per_epoch = len(train_loader)
+        num_epochs = (self.cfg.training.steps - 1) // steps_per_epoch + 1
         if self.is_rank_0:
             logger.info(
                 "Training for %d steps, that is, %d epochs on a "
