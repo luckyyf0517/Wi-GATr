@@ -52,7 +52,7 @@ seed: 1833
 debug: false
 checkpoint: null
 training:
-  steps: 125000
+  steps: 500000
   batchsize: 64
   eval_batchsize: 128
   lr: 0.001
