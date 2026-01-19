@@ -86,6 +86,11 @@ class BaseExperiment:
         self._initialize_experiment_folder()
         self._initialize_logger()
 
+        # Initialize SwanLab (only on rank 0)
+        self.swanlab_run = None
+        if self.is_rank_0:
+            self._initialize_swanlab()
+
         # Training hooks: list of (state, hook_function)
         self._hooks = []
 
@@ -129,6 +134,11 @@ class BaseExperiment:
         # Evaluate
         if evaluate:
             self.evaluate()
+
+        # Finish SwanLab run (only on rank 0)
+        if self.is_rank_0 and self.swanlab_run is not None:
+            self.swanlab_run.finish()
+            logger.info("SwanLab run finished.")
 
         logger.info("All done!")
         return self.metrics
@@ -306,6 +316,11 @@ class BaseExperiment:
             logger.info("Validation loop at step %d:", step)
             for key, value in metrics.items():
                 logger.info("    %s = %s", key, value)
+
+        # Log to SwanLab (only on rank 0)
+        if self.is_rank_0 and self.swanlab_run is not None:
+            swanlab_metrics = {f"val/{key}": value for key, value in metrics.items()}
+            self.swanlab_run.log(swanlab_metrics, step=step)
 
         # Early stopping: compare val loss to last val loss
         # Only rank 0 needs to track best state for checkpointing
@@ -624,6 +639,28 @@ class BaseExperiment:
         wigatr.utils.logger.LOGGING_INITIALIZED = True
         logger.info("Logger initialized.")
 
+    def _initialize_swanlab(self):
+        """Initializes SwanLab for experiment tracking."""
+
+        try:
+            import swanlab
+        except ImportError:
+            logger.warning("SwanLab is not installed. Skip SwanLab initialization.")
+            logger.info("To enable SwanLab, install it with: uv pip install swanlab")
+            return
+
+        # Initialize SwanLab run
+        exp_dir = Path(self.cfg.exp_dir).resolve()
+        self.swanlab_run = swanlab.init(
+            project=self.cfg.exp_name,
+            experiment_name=self.cfg.run_name,
+            description=f"Training {self.cfg.get('experiment_target', 'unknown')}",
+            config=OmegaConf.to_container(self.cfg, resolve=True),
+            logdir=str(exp_dir),
+            mode=None,  # Auto-detect online/offline mode
+        )
+        logger.info("SwanLab initialized. Project: %s, Experiment: %s", self.cfg.exp_name, self.cfg.run_name)
+
     @staticmethod
     def _init_plt():
         """Initializes matplotlib's rcparams to look good"""
@@ -698,18 +735,26 @@ class BaseExperiment:
             Gradient norm
         """
 
-        if not frequency_check(step, self.cfg.training.log_every_n_steps):
-            return {}
-
+        # Prepare metrics
         metrics["loss"] = loss.item()
         metrics["grad_norm"] = grad_norm
         metrics["step"] = step
         metrics["time_total_s"] = time.time() - self._training_start_time
         metrics["time_per_step_s"] = (time.time() - self._training_start_time) / (step + 1)
 
-        if not quiet:
+        # Console logging (respect frequency_check)
+        should_log_to_console = frequency_check(step, self.cfg.training.log_every_n_steps)
+        if not quiet and should_log_to_console:
             for key, values in metrics.items():
                 logging.info("Step %i: train.%s = %s", step, key, str(values))
+
+        # Log to SwanLab (only on rank 0)
+        # Use a default frequency of 5 if log_every_n_steps is None
+        if self.is_rank_0 and self.swanlab_run is not None:
+            swanlab_log_frequency = self.cfg.training.log_every_n_steps or 5
+            if frequency_check(step, swanlab_log_frequency):
+                swanlab_metrics = {f"train/{key}": value for key, value in metrics.items()}
+                self.swanlab_run.log(swanlab_metrics, step=step)
 
         return metrics
 
